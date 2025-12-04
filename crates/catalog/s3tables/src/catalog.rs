@@ -620,25 +620,40 @@ impl Catalog for S3TablesCatalog {
             .version_token(version_token)
             .metadata_location(staged_metadata_location);
 
-        let _ = builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                UpdateTableMetadataLocationError::ConflictException(_) => Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit conflicted for table: {table_ident}"),
-                )
-                .with_retryable(true),
-                UpdateTableMetadataLocationError::NotFoundException(_) => Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("Table {table_ident} is not found"),
-                ),
-                _ => Error::new(
-                    ErrorKind::Unexpected,
-                    "Operation failed for hitting aws sdk error",
-                ),
+        let file_io = staged_table.file_io();
+        let staged_metadata_location_str = staged_metadata_location.to_string();
+        match builder.send().await {
+            Ok(_) => {}
+            Err(e) => {
+                let error = e.into_service_error();
+                let err = match error {
+                    UpdateTableMetadataLocationError::ConflictException(_) => {
+                        // Clean up staged metadata file on conflict
+                        if let Err(cleanup_err) = file_io.delete(&staged_metadata_location_str).await {
+                            // Log cleanup failure but don't fail the error return
+                            eprintln!(
+                                "Warning: Failed to cleanup staged metadata file {}: {}",
+                                staged_metadata_location_str, cleanup_err
+                            );
+                        }
+                        Error::new(
+                            ErrorKind::CatalogCommitConflicts,
+                            format!("Commit conflicted for table: {table_ident}"),
+                        )
+                        .with_retryable(true)
+                    }
+                    UpdateTableMetadataLocationError::NotFoundException(_) => Error::new(
+                        ErrorKind::TableNotFound,
+                        format!("Table {table_ident} is not found"),
+                    ),
+                    _ => Error::new(
+                        ErrorKind::Unexpected,
+                        "Operation failed for hitting aws sdk error",
+                    ),
+                };
+                return Err(err.with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}"))));
             }
-            .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))
-        })?;
+        }
 
         Ok(staged_table)
     }
